@@ -1,0 +1,6 @@
+# 构建产物
+Linxy.exe
+*.o
+
+# 本地配置(含个人路径,不入库;模板见 shortcuts.example.ini)
+shortcuts.ini

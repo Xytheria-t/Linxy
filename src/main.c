@@ -16,6 +16,7 @@
 #include <tlhelp32.h>
 #include <shlobj.h>
 #include <objbase.h>
+#include <propsys.h>
 #include <wchar.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -30,11 +31,16 @@ typedef struct {
     WCHAR path[PATH_CAP];   /* target executable (resolved from a .lnk) */
     WCHAR args[PATH_CAP];   /* arguments kept from the .lnk, empty for plain paths */
     WCHAR appname[128];     /* .lnk file base name (= web app name) if any */
-    int   app;              /* 1 = browser-installed app (PWA): match by window title */
+    WCHAR appid[128];       /* --app-id hash from the .lnk args, if any */
+    int   app;              /* 1 = browser-installed app (PWA): toggle its windows */
     HWND  snap[16];         /* windows visible at hide time, restored on show */
     int   nsnap;
     HWND  last_main;        /* real main window last seen visible; survives the
                                snapshot going stale (tray-resident apps) */
+    DWORD last_launch;      /* tick of the last launch: re-presses while the
+                               browser is still creating the window must not
+                               start a second one (PWA relaunch never focuses
+                               the pending window, it opens another) */
     int   used;
 } Slot;
 
@@ -126,6 +132,7 @@ static int resolve_lnk(const WCHAR *lnk, WCHAR *out, int cap, WCHAR *args, int a
 }
 
 static int app_marker(const WCHAR *args, WCHAR *out, int cap);   /* defined below */
+static const WCHAR *wcs_isearch(const WCHAR *hay, const WCHAR *needle);   /* defined below */
 
 static void load_config(void)
 {
@@ -214,6 +221,19 @@ static void load_config(void)
             {
                 WCHAR marker[PATH_CAP];
                 slots[idx].app = app_marker(slots[idx].args, marker, PATH_CAP);
+            }
+            /* Chromium stamps every PWA window with an AppUserModelID carrying
+               the --app-id hash, so the app's windows can be found without
+               relying on the title (which varies with page and locale). */
+            const WCHAR *idp = wcs_isearch(slots[idx].args, L"--app-id=");
+            if (idp) {
+                idp += 9;
+                int t = 0;
+                while (idp[t] && idp[t] != L' ' && idp[t] != L'"' &&
+                       t < (int)(sizeof slots[idx].appid / sizeof slots[idx].appid[0]) - 1)
+                    t++;
+                memcpy(slots[idx].appid, idp, t * sizeof(WCHAR));
+                slots[idx].appid[t] = L'\0';
             }
         } else {
             /* Plain path, optionally quoted with launch arguments after it:
@@ -370,11 +390,34 @@ static int collect_windows(const DWORD *pids, int npids, HWND *out, int cap)
     return c.n;
 }
 
-/* ---- web app (PWA) windows: matched by title + owning process dir ---------
+/* ---- web app (PWA) windows ----------------------------------------------
    A browser-installed app such as DeepSeek is just a window inside the shared
-   browser process (its command line carries no marker), so processes cannot
-   tell it apart from normal browser tabs. We pick its windows by title:
-   they contain the .lnk app name and belong to the browser's executable. */
+   browser process, so processes cannot tell it apart from normal browser tabs.
+   Chromium tags each app window's AppUserModelID with the --app-id hash of its
+   shortcut; slots launched via --app=<url> carry no hash and fall back to
+   picking windows by title + owning process directory. */
+
+/* 0 = window has no AppUserModelID, 1 = AUMID present but not ours,
+   2 = AUMID carries our app's --app-id hash. */
+static int win_appid(HWND h, const WCHAR *appid)
+{
+    static const IID kIID_IPropertyStore =
+        {0x886D8EEB,0x8CF2,0x4446,{0x8F,0x02,0x9F,0xBB,0x0F,0xEF,0xFE,0x40}};
+    static const PROPERTYKEY kPKEY_AppUserModel_ID =
+        {{0x9F4C2855,0x9F79,0x4B39,{0xA8,0xD0,0xE1,0xD4,0x2D,0xE1,0xD5,0xF3}},5};
+    IPropertyStore *ps;
+    int r = 0;
+    if (SUCCEEDED(SHGetPropertyStoreForWindow(h, &kIID_IPropertyStore, (void **)&ps))) {
+        PROPVARIANT v;
+        PropVariantInit(&v);
+        if (SUCCEEDED(ps->lpVtbl->GetValue(ps, &kPKEY_AppUserModel_ID, &v)) &&
+            v.vt == VT_LPWSTR && v.pwszVal)
+            r = wcs_isearch(v.pwszVal, appid) ? 2 : 1;
+        PropVariantClear(&v);
+        ps->lpVtbl->Release(ps);
+    }
+    return r;
+}
 
 /* True if window h belongs to a process whose image lives under dir. */
 static int win_in_dir(HWND h, const WCHAR *dir)
@@ -398,12 +441,23 @@ typedef struct {
     int          n, cap;
     const WCHAR *dir;
     const WCHAR *name;
+    const WCHAR *appid;
 } PwaCtx;
 
 static BOOL CALLBACK pwa_enum(HWND h, LPARAM lp)
 {
     PwaCtx *c = (PwaCtx *)lp;
-    if (c->n < c->cap && win_in_dir(h, c->dir)) {
+    if (c->n >= c->cap) return TRUE;
+    if (*c->appid) {
+        int a = win_appid(h, c->appid);
+        if (a == 2) { c->wins[c->n++] = h; return TRUE; }
+        /* AUMID present but different: not this app. Plain browser windows
+           always carry the browser's own id, so a browser tab whose page
+           title merely contains the app name is never captured. Only windows
+           with no AUMID at all (non-Chromium hosts) use the title heuristic. */
+        if (a == 1) return TRUE;
+    }
+    if (win_in_dir(h, c->dir)) {
         WCHAR t[256];
         if (GetWindowTextW(h, t, sizeof t / sizeof t[0]) > 0 &&
             wcs_isearch(t, c->name))
@@ -418,7 +472,7 @@ static int collect_pwa_windows(const Slot *s, HWND *out, int cap)
     wcscpy(dir, s->path);
     WCHAR *sl = wcsrchr(dir, L'\\');
     if (sl) *sl = L'\0';
-    PwaCtx c = { out, 0, cap, dir, s->appname };
+    PwaCtx c = { out, 0, cap, dir, s->appname, s->appid };
     EnumWindows(pwa_enum, (LPARAM)&c);
     return c.n;
 }
@@ -649,6 +703,12 @@ static void pwa_toggle(Slot *s)
     if (revive_snapshot(s)) return;
     if (revive_any(wins, n)) return;
     if (revive_hidden_main(s, wins, n)) return;
+    /* Chromium needs a few seconds to put the launched window on screen, and
+       relaunching the same --app-id opens another window instead of focusing
+       the pending one. Ignore presses inside that gap. */
+    DWORD now = GetTickCount64();
+    if (s->last_launch && now - s->last_launch < 4000) return;
+    s->last_launch = now;
     launch_slot(s);   /* snapshot fully stale and nothing to revive */
 }
 

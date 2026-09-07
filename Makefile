@@ -5,7 +5,7 @@ TARGET := Linxy.exe
 DEPLOY_DIR ?= /mnt/d/Tool/Linxy
 
 $(TARGET): src/main.c
-	$(CC) $(CFLAGS) -o $@ $< -lole32 -luuid -lshell32
+	$(CC) $(CFLAGS) -o $@ $< -lole32 -luuid -lshell32 -lpropsys
 
 deploy: $(TARGET)
 	cp -f $(TARGET) $(DEPLOY_DIR)/

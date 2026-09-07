@@ -3,8 +3,7 @@
  * One slot per letter A..Z, configured in shortcuts.ini next to the exe.
  * Default combos: Shift+Alt+<letter> toggles (launch/show/hide),
  * Shift+Alt+Ctrl+<letter> terminates the target app.
- * .lnk targets keep their arguments, so browser-installed apps (PWAs) launch
- * and toggle as the app itself instead of opening a blank browser.
+ * .lnk targets resolve to their executable; launch arguments are kept.
  * Build with mingw-w64 (see Makefile). Single zero-dependency exe.
  */
 
@@ -16,7 +15,6 @@
 #include <tlhelp32.h>
 #include <shlobj.h>
 #include <objbase.h>
-#include <propsys.h>
 #include <wchar.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -29,18 +27,11 @@
 
 typedef struct {
     WCHAR path[PATH_CAP];   /* target executable (resolved from a .lnk) */
-    WCHAR args[PATH_CAP];   /* arguments kept from the .lnk, empty for plain paths */
-    WCHAR appname[128];     /* .lnk file base name (= web app name) if any */
-    WCHAR appid[128];       /* --app-id hash from the .lnk args, if any */
-    int   app;              /* 1 = browser-installed app (PWA): toggle its windows */
+    WCHAR args[PATH_CAP];   /* launch arguments (quoted path or .lnk), may be empty */
     HWND  snap[16];         /* windows visible at hide time, restored on show */
     int   nsnap;
     HWND  last_main;        /* real main window last seen visible; survives the
                                snapshot going stale (tray-resident apps) */
-    DWORD last_launch;      /* tick of the last launch: re-presses while the
-                               browser is still creating the window must not
-                               start a second one (PWA relaunch never focuses
-                               the pending window, it opens another) */
     int   used;
 } Slot;
 
@@ -131,9 +122,6 @@ static int resolve_lnk(const WCHAR *lnk, WCHAR *out, int cap, WCHAR *args, int a
     return ok;
 }
 
-static int app_marker(const WCHAR *args, WCHAR *out, int cap);   /* defined below */
-static const WCHAR *wcs_isearch(const WCHAR *hay, const WCHAR *needle);   /* defined below */
-
 static void load_config(void)
 {
     WCHAR path[PATH_CAP + 32];
@@ -209,32 +197,6 @@ static void load_config(void)
                 WARN(L"第 %d 行:快捷方式无法解析\n", line_no);
                 continue;
             }
-            /* The .lnk file name is the installed web app's name (e.g.
-               DeepSeek.lnk -> "DeepSeek"). Used to pick the app's own windows
-               by title. */
-            const WCHAR *b = wcsrchr(path, L'\\');
-            b = b ? b + 1 : path;
-            copy_wide(slots[idx].appname,
-                      sizeof slots[idx].appname / sizeof slots[idx].appname[0], b);
-            WCHAR *dot = wcsrchr(slots[idx].appname, L'.');
-            if (dot) *dot = L'\0';
-            {
-                WCHAR marker[PATH_CAP];
-                slots[idx].app = app_marker(slots[idx].args, marker, PATH_CAP);
-            }
-            /* Chromium stamps every PWA window with an AppUserModelID carrying
-               the --app-id hash, so the app's windows can be found without
-               relying on the title (which varies with page and locale). */
-            const WCHAR *idp = wcs_isearch(slots[idx].args, L"--app-id=");
-            if (idp) {
-                idp += 9;
-                int t = 0;
-                while (idp[t] && idp[t] != L' ' && idp[t] != L'"' &&
-                       t < (int)(sizeof slots[idx].appid / sizeof slots[idx].appid[0]) - 1)
-                    t++;
-                memcpy(slots[idx].appid, idp, t * sizeof(WCHAR));
-                slots[idx].appid[t] = L'\0';
-            }
         } else {
             /* Plain path, optionally quoted with launch arguments after it:
                X="C:\dir with spaces\app.exe" -flag1 -flag2 */
@@ -253,8 +215,6 @@ static void load_config(void)
                           sizeof slots[idx].path / sizeof slots[idx].path[0], path);
                 slots[idx].args[0] = L'\0';
             }
-            slots[idx].appname[0] = L'\0';
-            slots[idx].app = 0;
         }
         slots[idx].used = 1;
     }
@@ -301,55 +261,6 @@ static int match_pass(const WCHAR *full, const WCHAR *base, DWORD *out, int cap)
     return n;
 }
 
-/* ---- case-insensitive substring helpers ---------------------------------- */
-
-static WCHAR wch_lower(WCHAR c)
-{
-    return (c >= L'A' && c <= L'Z') ? c - L'A' + L'a' : c;
-}
-
-static const WCHAR *wcs_isearch(const WCHAR *hay, const WCHAR *needle)
-{
-    size_t nl = wcslen(needle);
-    if (!nl) return hay;
-    for (; *hay; hay++) {
-        size_t i = 0;
-        while (i < nl && hay[i] && wch_lower(hay[i]) == wch_lower(needle[i])) i++;
-        if (i == nl) return hay;
-    }
-    return NULL;
-}
-
-/*
- * If the .lnk arguments carry a PWA-style "--app..." token (--app=URL or
- * --app-id=<hash>), copy that token into out and return 1. That token alone
- * identifies the app's own process, telling it apart from the plain browser.
- */
-static int app_marker(const WCHAR *args, WCHAR *out, int cap)
-{
-    const WCHAR *p = args;
-    while (*p) {
-        while (*p == L' ') p++;
-        if (!*p) break;
-        int t = 0;
-        WCHAR tok[PATH_CAP];
-        if (*p == L'"') {
-            p++;
-            while (*p && *p != L'"' && t < PATH_CAP - 1) tok[t++] = *p++;
-            if (*p == L'"') p++;
-        } else {
-            while (*p && *p != L' ' && t < PATH_CAP - 1) tok[t++] = *p++;
-        }
-        tok[t] = L'\0';
-        if (wcsncmp(tok, L"--app", 5) == 0 &&
-            (tok[5] == L'=' || tok[5] == L'-' || tok[5] == L'\0')) {
-            copy_wide(out, cap, tok);
-            return 1;
-        }
-    }
-    return 0;
-}
-
 /*
  * Find PIDs of the target app, incl. manual starts. Exact image path first;
  * aliases (e.g. Windows 11 notepad launches from WindowsApps) never match the
@@ -387,93 +298,6 @@ static int collect_windows(const DWORD *pids, int npids, HWND *out, int cap)
 {
     EnumCtx c = { out, 0, cap, pids, npids };
     EnumWindows(enum_proc, (LPARAM)&c);
-    return c.n;
-}
-
-/* ---- web app (PWA) windows ----------------------------------------------
-   A browser-installed app such as DeepSeek is just a window inside the shared
-   browser process, so processes cannot tell it apart from normal browser tabs.
-   Chromium tags each app window's AppUserModelID with the --app-id hash of its
-   shortcut; slots launched via --app=<url> carry no hash and fall back to
-   picking windows by title + owning process directory. */
-
-/* 0 = window has no AppUserModelID, 1 = AUMID present but not ours,
-   2 = AUMID carries our app's --app-id hash. */
-static int win_appid(HWND h, const WCHAR *appid)
-{
-    static const IID kIID_IPropertyStore =
-        {0x886D8EEB,0x8CF2,0x4446,{0x8F,0x02,0x9F,0xBB,0x0F,0xEF,0xFE,0x40}};
-    static const PROPERTYKEY kPKEY_AppUserModel_ID =
-        {{0x9F4C2855,0x9F79,0x4B39,{0xA8,0xD0,0xE1,0xD4,0x2D,0xE1,0xD5,0xF3}},5};
-    IPropertyStore *ps;
-    int r = 0;
-    if (SUCCEEDED(SHGetPropertyStoreForWindow(h, &kIID_IPropertyStore, (void **)&ps))) {
-        PROPVARIANT v;
-        PropVariantInit(&v);
-        if (SUCCEEDED(ps->lpVtbl->GetValue(ps, &kPKEY_AppUserModel_ID, &v)) &&
-            v.vt == VT_LPWSTR && v.pwszVal)
-            r = wcs_isearch(v.pwszVal, appid) ? 2 : 1;
-        PropVariantClear(&v);
-        ps->lpVtbl->Release(ps);
-    }
-    return r;
-}
-
-/* True if window h belongs to a process whose image lives under dir. */
-static int win_in_dir(HWND h, const WCHAR *dir)
-{
-    DWORD pid;
-    GetWindowThreadProcessId(h, &pid);
-    HANDLE p = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
-    if (!p) return 0;
-    WCHAR img[PATH_CAP];
-    DWORD sz = PATH_CAP;
-    int ok = QueryFullProcessImageNameW(p, 0, img, &sz);
-    CloseHandle(p);
-    if (!ok) return 0;
-    size_t dl = wcslen(dir);
-    if (_wcsnicmp(img, dir, dl) != 0) return 0;
-    return img[dl] == L'\0' || img[dl] == L'\\';
-}
-
-typedef struct {
-    HWND        *wins;
-    int          n, cap;
-    const WCHAR *dir;
-    const WCHAR *name;
-    const WCHAR *appid;
-} PwaCtx;
-
-static BOOL CALLBACK pwa_enum(HWND h, LPARAM lp)
-{
-    PwaCtx *c = (PwaCtx *)lp;
-    if (c->n >= c->cap) return TRUE;
-    if (*c->appid) {
-        int a = win_appid(h, c->appid);
-        if (a == 2) { c->wins[c->n++] = h; return TRUE; }
-        /* AUMID present but different: not this app. Plain browser windows
-           always carry the browser's own id, so a browser tab whose page
-           title merely contains the app name is never captured. Only windows
-           with no AUMID at all (non-Chromium hosts) use the title heuristic. */
-        if (a == 1) return TRUE;
-    }
-    if (win_in_dir(h, c->dir)) {
-        WCHAR t[256];
-        if (GetWindowTextW(h, t, sizeof t / sizeof t[0]) > 0 &&
-            wcs_isearch(t, c->name))
-            c->wins[c->n++] = h;
-    }
-    return TRUE;
-}
-
-static int collect_pwa_windows(const Slot *s, HWND *out, int cap)
-{
-    WCHAR dir[PATH_CAP];
-    wcscpy(dir, s->path);
-    WCHAR *sl = wcsrchr(dir, L'\\');
-    if (sl) *sl = L'\0';
-    PwaCtx c = { out, 0, cap, dir, s->appname, s->appid };
-    EnumWindows(pwa_enum, (LPARAM)&c);
     return c.n;
 }
 
@@ -571,14 +395,7 @@ static int looks_main(HWND h)
     return 1;
 }
 
-/* ---- toggle building blocks (shared by normal and web-app slots) --------- */
-
-static int any_unminimized(const HWND *wins, int n)
-{
-    for (int i = 0; i < n; i++)
-        if (IsWindowVisible(wins[i]) && !IsIconic(wins[i])) return 1;
-    return 0;
-}
+/* ---- toggle building blocks ---------------------------------------------- */
 
 /* True if a real main window is on screen (visible and un-minimized).
    Satellite windows (desktop lyrics, toast popups, tool windows) never
@@ -687,46 +504,8 @@ static int revive_hidden_main(Slot *s, const HWND *wins, int n)
     return 1;
 }
 
-/* Web-app slots toggle at the window level: hide / restore / reopen the
-   app's own window(s) regardless of whether the browser runs them as a
-   separate process or hosts them inside the shared browser instance. */
-static void pwa_toggle(Slot *s)
-{
-    HWND wins[64];
-    int n = collect_pwa_windows(s, wins, 64);
-    note_main(s, wins, n);
-
-    if (any_unminimized(wins, n)) {
-        hide_snapshot(s, wins, n);
-        return;
-    }
-    if (revive_snapshot(s)) return;
-    if (revive_any(wins, n)) return;
-    if (revive_hidden_main(s, wins, n)) return;
-    /* Chromium needs a few seconds to put the launched window on screen, and
-       relaunching the same --app-id opens another window instead of focusing
-       the pending one. Ignore presses inside that gap. */
-    DWORD now = GetTickCount64();
-    if (s->last_launch && now - s->last_launch < 4000) return;
-    s->last_launch = now;
-    launch_slot(s);   /* snapshot fully stale and nothing to revive */
-}
-
-/* Closing a web app means closing its window(s), not killing the shared
-   browser process the window may live in. */
-static void pwa_kill(Slot *s)
-{
-    s->nsnap = 0;
-    s->last_main = NULL;
-    HWND wins[64];
-    int n = collect_pwa_windows(s, wins, 64);
-    for (int i = 0; i < n; i++)
-        if (IsWindow(wins[i])) PostMessageW(wins[i], WM_CLOSE, 0, 0);
-}
-
 static void toggle_slot(Slot *s)
 {
-    if (s->app) { pwa_toggle(s); return; }
     DWORD pids[16];
     int npids = find_pids(s->path, pids, 16);
 
@@ -776,7 +555,6 @@ static void toggle_slot(Slot *s)
 
 static void kill_slot(Slot *s)
 {
-    if (s->app) { pwa_kill(s); return; }
     s->nsnap = 0;
     s->last_main = NULL;
     DWORD pids[16];

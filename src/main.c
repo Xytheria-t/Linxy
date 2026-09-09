@@ -32,6 +32,8 @@ typedef struct {
     int   nsnap;
     HWND  last_main;        /* real main window last seen visible; survives the
                                snapshot going stale (tray-resident apps) */
+    WCHAR title[128];       /* "!" slot: window title to match, from the .lnk name */
+    int   by_title;         /* 1 = toggle opens/closes, never hides (needs .lnk) */
     int   used;
 } Slot;
 
@@ -177,6 +179,12 @@ static void load_config(void)
         char *key = line, *val = eq + 1;
         strip_ws(val);
 
+        /* A trailing "!" marks a slot whose toggle key closes the app instead
+           of hiding it (X!=path.lnk). Only .lnk targets can carry it: the
+           link's file name is what identifies the app's windows. */
+        int no_hide = 0;
+        if (strlen(key) == 2 && key[1] == '!') { no_hide = 1; key[1] = '\0'; }
+
         /* Unknown directives are reported; slot lines are handled below. */
         if (strlen(key) != 1) {
             WCHAR wkey[32];
@@ -197,7 +205,21 @@ static void load_config(void)
                 WARN(L"第 %d 行:快捷方式无法解析\n", line_no);
                 continue;
             }
+            if (no_hide) {
+                /* Vinea.lnk -> match windows titled "...Vinea..." */
+                const WCHAR *b = wcsrchr(path, L'\\');
+                b = b ? b + 1 : path;
+                copy_wide(slots[idx].title,
+                          sizeof slots[idx].title / sizeof slots[idx].title[0], b);
+                WCHAR *dot = wcsrchr(slots[idx].title, L'.');
+                if (dot) *dot = L'\0';
+                slots[idx].by_title = 1;
+            }
         } else {
+            if (no_hide) {
+                WARN(L"第 %d 行:\"!\" 槽位只能指向 .lnk(按窗口标题识别)\n", line_no);
+                continue;
+            }
             /* Plain path, optionally quoted with launch arguments after it:
                X="C:\dir with spaces\app.exe" -flag1 -flag2 */
             const WCHAR *cq = (path[0] == L'"') ? wcschr(path + 1, L'"') : NULL;
@@ -299,6 +321,80 @@ static int collect_windows(const DWORD *pids, int npids, HWND *out, int cap)
     EnumCtx c = { out, 0, cap, pids, npids };
     EnumWindows(enum_proc, (LPARAM)&c);
     return c.n;
+}
+
+/* ---- "!" slots: windows found by title, not by process --------------------
+   A window launched with a browser's --app=URL lives inside the shared browser
+   process, so process lookup cannot tell it apart from ordinary tabs - and
+   closing "the process" would take the whole browser down with it. Pick the
+   app's windows by title instead: they contain the .lnk file name and belong
+   to a process running from the same directory as the target. */
+static int title_contains(const WCHAR *text, const WCHAR *needle)
+{
+    if (!*needle) return 0;
+    for (const WCHAR *p = text; *p; p++) {
+        const WCHAR *a = p, *b = needle;
+        while (*a && *b &&
+               ((*a >= L'A' && *a <= L'Z') ? *a + 32 : *a) ==
+               ((*b >= L'A' && *b <= L'Z') ? *b + 32 : *b)) { a++; b++; }
+        if (!*b) return 1;
+    }
+    return 0;
+}
+
+/* True if window h belongs to a process whose image lives under dir. */
+static int win_in_dir(HWND h, const WCHAR *dir)
+{
+    DWORD pid;
+    GetWindowThreadProcessId(h, &pid);
+    HANDLE p = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!p) return 0;
+    WCHAR img[PATH_CAP];
+    DWORD sz = PATH_CAP;
+    int ok = QueryFullProcessImageNameW(p, 0, img, &sz);
+    CloseHandle(p);
+    if (!ok) return 0;
+    size_t dl = wcslen(dir);
+    if (_wcsnicmp(img, dir, dl) != 0) return 0;
+    return img[dl] == L'\0' || img[dl] == L'\\';
+}
+
+typedef struct {
+    HWND        *wins;
+    int          n, cap;
+    const WCHAR *dir;
+    const WCHAR *name;
+} TitleCtx;
+
+static BOOL CALLBACK title_enum(HWND h, LPARAM lp)
+{
+    TitleCtx *c = (TitleCtx *)lp;
+    if (c->n < c->cap && (IsWindowVisible(h) || IsIconic(h)) && win_in_dir(h, c->dir)) {
+        WCHAR t[256];
+        if (GetWindowTextW(h, t, sizeof t / sizeof t[0]) > 0 &&
+            title_contains(t, c->name))
+            c->wins[c->n++] = h;
+    }
+    return TRUE;
+}
+
+/* Windows of a "!" slot: minimized ones count as open, so a second press
+   closes them instead of restoring. */
+static int collect_titled(const Slot *s, HWND *out, int cap)
+{
+    WCHAR dir[PATH_CAP];
+    copy_wide(dir, PATH_CAP, s->path);
+    WCHAR *sl = wcsrchr(dir, L'\\');
+    if (sl) *sl = L'\0';
+    TitleCtx c = { out, 0, cap, dir, s->title };
+    EnumWindows(title_enum, (LPARAM)&c);
+    return c.n;
+}
+
+static void close_windows(const HWND *wins, int n)
+{
+    for (int i = 0; i < n; i++)
+        if (IsWindow(wins[i])) PostMessageW(wins[i], WM_CLOSE, 0, 0);
 }
 
 /* One AttachThreadInput foreground grab. Returns 1 if hwnd ended foreground. */
@@ -506,6 +602,15 @@ static int revive_hidden_main(Slot *s, const HWND *wins, int n)
 
 static void toggle_slot(Slot *s)
 {
+    /* "!" slot: open/close only. Never hides, so the app's own state decides
+       what a second press means. */
+    if (s->by_title) {
+        HWND tw[64];
+        int tn = collect_titled(s, tw, 64);
+        if (tn > 0) close_windows(tw, tn);
+        else        launch_slot(s);
+        return;
+    }
     DWORD pids[16];
     int npids = find_pids(s->path, pids, 16);
 
@@ -557,6 +662,12 @@ static void kill_slot(Slot *s)
 {
     s->nsnap = 0;
     s->last_main = NULL;
+    if (s->by_title) {
+        HWND tw[64];
+        int tn = collect_titled(s, tw, 64);
+        close_windows(tw, tn);
+        return;
+    }
     DWORD pids[16];
     int npids = find_pids(s->path, pids, 16);
     if (npids == 0) return;
